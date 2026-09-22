@@ -17,6 +17,8 @@
 
 以及 **区间预留试算** 接口 `POST /reservation-simulate`：给定只有容量上限（无补充概念）的桶与一批携带 `start` / `end` / `cost` / `chain` 的区间预留，按 `start` 升序处理；仅当预留的整个半开区间 `[start, end)` 内链上每个桶的并发占用加 `cost` 处处不超过 `capacity` 时才**原子接受**，否则拒绝且不改变任何占用。返回按原始输入索引排列的逐项结果，以及每个桶**合并后的占用区间**与**峰值并发**。
 
+以及 **候选链路由试算** 接口 `POST /route-simulate`：桶定义与 `/simulate` 相同（共享的连续补充令牌桶），但每个请求把单一 `chain` 换成多条候选链 `chains`。按时间顺序回放，逐请求在**全部桶都有余额**的候选链中，按**扣减后链上最大占用率最小**（占用率 = `(capacity − 扣减后余额) / capacity`，取链上各桶最大值；并列按候选顺序）挑选一条放行，**仅扣选中链**；无候选可行时**所有桶原子不变**，并逐候选给出首个不足桶。响应按原始索引返回选中链、余额快照、拒绝原因与终态余额。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -36,6 +38,7 @@ docker compose up --build
 | 使用分析接口 | http://localhost:8000/usage-report （POST） |
 | 公平性分析接口 | http://localhost:8000/fairness-report （POST） |
 | 预留试算接口 | http://localhost:8000/reservation-simulate （POST） |
+| 路由试算接口 | http://localhost:8000/route-simulate （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -545,6 +548,132 @@ docker compose up --build
 - index 0 接受；index 1 与 index 0 在 `[2,3)` 重叠，`room_b` 容量 1 放不下第二笔，被原子拒绝（`room_a` 也不留占用）；
 - index 2、3 接受：`room_a` 在 `[6,7)` 峰值并发 2；index 4 在 t=7 与 index 3 端点相接（半开，不并发），链上均有空位，接受。
 
+## 请求格式 `POST /route-simulate`
+
+桶定义与 `/simulate` 相同（共享的连续补充令牌桶）；每个请求把单一 `chain` 换成多条候选链 `chains`，由服务逐请求挑选一条放行。
+
+```json
+{
+  "buckets": [
+    {"id": "chain_a_api", "capacity": 10, "refill_rate": 1, "initial": 10},
+    {"id": "chain_b_api", "capacity": 10, "refill_rate": 1, "initial": 6},
+    {"id": "shared_db", "capacity": 4, "refill_rate": 0.5, "initial": 4}
+  ],
+  "requests": [
+    {"id": "r1", "timestamp": 0, "cost": 4, "chains": [["chain_a_api", "shared_db"], ["chain_b_api"]]},
+    {"id": "r2", "timestamp": 0, "cost": 3, "chains": [["chain_b_api"], ["chain_a_api"]]},
+    {"id": "r3", "timestamp": 2, "cost": 4, "chains": [["chain_a_api", "shared_db"], ["chain_b_api"]]},
+    {"id": "r4", "timestamp": 3, "cost": 2, "chains": [["chain_b_api"], ["chain_a_api", "shared_db"]]},
+    {"id": "r5", "timestamp": 4, "cost": 5, "chains": [["chain_a_api"], ["chain_b_api"]]},
+    {"id": "r6", "timestamp": 5, "cost": 6, "chains": [["chain_a_api"], ["chain_b_api"], ["chain_a_api", "shared_db"]]}
+  ]
+}
+```
+
+### 字段说明
+
+**桶 `buckets[]`**：同 `/simulate`（`id` / `capacity` / `refill_rate` / 可选 `initial`）。
+
+**请求 `requests[]`**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 请求唯一标识 |
+| `timestamp` | 是 | 请求时间（秒，任意一致的时间原点） |
+| `cost` | 是 | 消耗量，必须 > 0；从**选中链**上每个桶各扣此数量 |
+| `chains` | 是 | 候选桶链列表（至少 1 条）；每条链至少引用 1 个桶、链内不可重复 |
+
+### 路由语义
+
+1. **时间顺序**：与 `/simulate` 一致——按 `timestamp` 升序处理，同一时刻按输入数组顺序处理；`results` 仍按原始数组顺序返回（含 `index`）。
+2. **连续补充**：与 `/simulate` 完全一致的共享令牌桶。请求触及的桶 = 其全部候选链引用桶的并集；判定时这些桶都补充到当前时刻（无论最终放行与否，时间都会推进）。
+3. **候选可行**：一条候选链仅当链上**每个桶**余额都 ≥ `cost` 时才可被选（与 `/simulate` 同一 EPS 容差）。
+4. **选链规则**：在可行候选中，按**扣减后链上最大占用率最小**选择——占用率 = `(capacity − 扣减后余额) / capacity`，取链上各桶的最大值；并列时按候选顺序取在前者。该规则倾向把请求路由到扣减后负载最轻的链。
+5. **原子扣减**：放行时**仅扣选中链**上的桶（每个桶扣 `cost`），其余桶保持不变；无候选可行时拒绝，**所有桶保持不变**，`rejections` 逐候选给出该链上第一个余额不足的桶及其判定时刻余额。
+6. **余额快照**：`balances` 覆盖本请求触及的所有桶（全部候选链的并集，按首次出现顺序），`before` 为补充之后、扣减之前的余额，`after` 为扣减之后（未选中链与被拒绝时与 `before` 相同）。
+7. **终态**：`final_balances` 给出所有桶推进到最后一个时间戳后的余额。
+
+### 响应示例
+
+```json
+{
+  "allowed_count": 5,
+  "rejected_count": 1,
+  "results": [
+    {
+      "request_id": "r1", "index": 0, "timestamp": 0.0, "allowed": true,
+      "selected_chain_index": 1, "selected_chain": ["chain_b_api"],
+      "balances": {
+        "chain_a_api": {"before": 10.0, "after": 10.0},
+        "shared_db": {"before": 4.0, "after": 4.0},
+        "chain_b_api": {"before": 6.0, "after": 2.0}
+      },
+      "rejections": null
+    },
+    {
+      "request_id": "r2", "index": 1, "timestamp": 0.0, "allowed": true,
+      "selected_chain_index": 1, "selected_chain": ["chain_a_api"],
+      "balances": {
+        "chain_b_api": {"before": 2.0, "after": 2.0},
+        "chain_a_api": {"before": 10.0, "after": 7.0}
+      },
+      "rejections": null
+    },
+    {
+      "request_id": "r3", "index": 2, "timestamp": 2.0, "allowed": true,
+      "selected_chain_index": 0, "selected_chain": ["chain_a_api", "shared_db"],
+      "balances": {
+        "chain_a_api": {"before": 9.0, "after": 5.0},
+        "shared_db": {"before": 4.0, "after": 0.0},
+        "chain_b_api": {"before": 4.0, "after": 4.0}
+      },
+      "rejections": null
+    },
+    {
+      "request_id": "r4", "index": 3, "timestamp": 3.0, "allowed": true,
+      "selected_chain_index": 0, "selected_chain": ["chain_b_api"],
+      "balances": {
+        "chain_b_api": {"before": 5.0, "after": 3.0},
+        "chain_a_api": {"before": 6.0, "after": 6.0},
+        "shared_db": {"before": 0.5, "after": 0.5}
+      },
+      "rejections": null
+    },
+    {
+      "request_id": "r5", "index": 4, "timestamp": 4.0, "allowed": true,
+      "selected_chain_index": 0, "selected_chain": ["chain_a_api"],
+      "balances": {
+        "chain_a_api": {"before": 7.0, "after": 2.0},
+        "chain_b_api": {"before": 4.0, "after": 4.0}
+      },
+      "rejections": null
+    },
+    {
+      "request_id": "r6", "index": 5, "timestamp": 5.0, "allowed": false,
+      "selected_chain_index": null, "selected_chain": null,
+      "balances": {
+        "chain_a_api": {"before": 3.0, "after": 3.0},
+        "chain_b_api": {"before": 5.0, "after": 5.0},
+        "shared_db": {"before": 1.5, "after": 1.5}
+      },
+      "rejections": [
+        {"chain_index": 0, "rejected_by": "chain_a_api", "available": 3.0},
+        {"chain_index": 1, "rejected_by": "chain_b_api", "available": 5.0},
+        {"chain_index": 2, "rejected_by": "chain_a_api", "available": 3.0}
+      ]
+    }
+  ],
+  "final_balances": {"chain_a_api": 3.0, "chain_b_api": 5.0, "shared_db": 1.5}
+}
+```
+
+- r1：两条候选都可行；候选 0 扣后 `shared_db` 占用率 (4−0)/4 = 1.0，候选 1 扣后 `chain_b_api` 占用率 (10−2)/10 = 0.8 → 选候选 1，仅 `chain_b_api` 扣 4；
+- r2：候选 0 的 `chain_b_api` 余额 2 不足，落到候选 1，`chain_a_api` 10→7；
+- r3：t=2 补充后两条候选都可行，且扣减后最大占用率同为 1.0（候选 0 受 `shared_db` 限制、候选 1 受 `chain_b_api` 限制）→ 并列按候选顺序选候选 0，`chain_a_api` 9→5、`shared_db` 4→0；
+- r4：候选 1 因 `shared_db`（0.5）不足被跳过，选候选 0，`chain_b_api` 5→3；
+- r5：候选 1 的 `chain_b_api`（4）不足，选候选 0，`chain_a_api` 7→2；
+- r6：三条候选的首个不足桶分别为 `chain_a_api`（3）、`chain_b_api`（5）、`chain_a_api`（3），全部不可行 → 原子拒绝，所有桶保持，`rejections` 逐候选列出。
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
@@ -555,9 +684,10 @@ docker compose up --build
 - **非法窗口宽度**：`window_seconds` 缺失、非有限数值或 `<= 0`（`/usage-report` 与 `/fairness-report`）；
 - **非法主体字段**（仅 `/fairness-report`）：`principal` 缺失或不是非空字符串；`weight` 非有限数值或 `<= 0`；同一 `principal` 在不同请求中权重不一致（`inconsistent_principal_weight`）；
 - **非法预留区间**：`start` / `end` 非有限数值，或 `end <= start`（仅 `/reservation-simulate`）；
-- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口）、多余字段（`extra="forbid"`）。
+- **非法候选链**（仅 `/route-simulate`）：`chains` 为空、候选链为空、候选链内桶重复；候选链引用未定义的桶同样报 `unknown_bucket_ref`（`loc` 定位到具体候选链）；
+- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口与 `/route-simulate`）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report` 与 `/reservation-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型）。
+以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate` 与 `/route-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对每条候选链做引用校验）。
 
 ## 本地调用示例
 
@@ -585,6 +715,10 @@ curl -X POST http://localhost:8000/fairness-report \
 curl -X POST http://localhost:8000/reservation-simulate \
   -H 'Content-Type: application/json' \
   -d @examples/reservation-simulate.json
+
+curl -X POST http://localhost:8000/route-simulate \
+  -H 'Content-Type: application/json' \
+  -d @examples/route-simulate.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -614,6 +748,7 @@ pytest -q
 │   ├── usage.py         # 配额使用分析引擎（按窗口统计消耗/拒绝/峰值占用）
 │   ├── fairness.py      # 主体公平性分析引擎（加权 Jain 指数/最受限主体/首个短缺桶）
 │   ├── reservation.py   # 区间预留试算引擎（容量受限的链上原子预留）
+│   ├── routing.py       # 候选链路由试算引擎（多候选链选路 + 原子扣减）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
@@ -622,6 +757,7 @@ pytest -q
 ├── examples/usage-report.json
 ├── examples/fairness-report.json
 ├── examples/reservation-simulate.json
+├── examples/route-simulate.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口
