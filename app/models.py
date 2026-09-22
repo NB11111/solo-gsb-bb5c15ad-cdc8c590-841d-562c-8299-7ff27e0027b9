@@ -847,3 +847,182 @@ class ReservationSimulateResponse(BaseModel):
         list[ReservationBucketOccupancy],
         Field(description="各桶合并后的占用区间与峰值并发，按 buckets 输入顺序"),
     ]
+
+
+class RouteRequest(BaseModel):
+    """单次路由试算请求：在多条候选桶链中选择一条扣减。
+
+    candidates: 候选桶链列表（至少一条）；仅当某条候选链上所有桶余额都
+    充足时该链才可选，选中链上每个桶各扣 cost。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, Field(min_length=1, description="请求唯一标识")]
+    timestamp: Annotated[float, Field(description="请求时间（秒，任意一致的时间原点）")]
+    cost: Annotated[float, Field(gt=0, description="消耗量（从选中链上每个桶扣减的令牌数）")]
+    candidates: Annotated[
+        list[list[str]],
+        Field(min_length=1, description="候选桶链列表：每条链为按顺序引用的桶 ID 列表"),
+    ]
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _validate_timestamp(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("timestamp 必须是有限数值")
+        return value
+
+    @field_validator("cost", mode="before")
+    @classmethod
+    def _validate_cost(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("cost 必须是有限数值")
+        if value <= 0:
+            raise ValueError("cost 必须为正数")
+        return value
+
+    @field_validator("candidates")
+    @classmethod
+    def _validate_candidates_shape(cls, value: list[list[str]]):
+        if not value:
+            raise ValueError("candidates 至少需要一条候选链")
+        for chain in value:
+            if not chain:
+                raise ValueError("候选链至少需要引用一个桶")
+            seen: set[str] = set()
+            for bucket_id in chain:
+                if not isinstance(bucket_id, str) or not bucket_id:
+                    raise ValueError("候选链中的桶 ID 必须是非空字符串")
+                if bucket_id in seen:
+                    raise ValueError(f"候选链中存在重复桶引用: {bucket_id}")
+                seen.add(bucket_id)
+        return value
+
+
+def _route_cross_validation_errors(
+    buckets: list[BucketSpec], requests: list[RouteRequest]
+) -> list[dict]:
+    """/route-simulate 请求体的跨字段校验：重复桶、候选链未知桶引用、重复请求 ID。"""
+    errors: list[dict] = []
+
+    # 重复桶 ID
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for index, bucket in enumerate(buckets):
+        if bucket.id in seen:
+            duplicates.add(bucket.id)
+            errors.append(
+                {
+                    "type": "duplicate_bucket",
+                    "loc": ("buckets", index, "id"),
+                    "msg": f"重复的桶 ID: {bucket.id}",
+                    "input": bucket.id,
+                }
+            )
+        seen.add(bucket.id)
+
+    if duplicates:
+        # 已存在重复定义，引用校验意义不大，直接返回
+        return errors
+
+    # 候选链中未知引用
+    for r_index, request in enumerate(requests):
+        for c_index, chain in enumerate(request.candidates):
+            for b_index, bucket_id in enumerate(chain):
+                if bucket_id not in seen:
+                    errors.append(
+                        {
+                            "type": "unknown_bucket_ref",
+                            "loc": ("requests", r_index, "candidates", c_index, b_index),
+                            "msg": (
+                                f"请求 {request.id!r} 的候选链 {c_index} "
+                                f"引用了未定义的桶: {bucket_id}"
+                            ),
+                            "input": bucket_id,
+                        }
+                    )
+
+    # 重复请求 ID（便于调用方定位模拟结果）
+    seen_req: set[str] = set()
+    for r_index, request in enumerate(requests):
+        if request.id in seen_req:
+            errors.append(
+                {
+                    "type": "duplicate_request",
+                    "loc": ("requests", r_index, "id"),
+                    "msg": f"重复的请求 ID: {request.id}",
+                    "input": request.id,
+                }
+            )
+        seen_req.add(request.id)
+
+    return errors
+
+
+class RouteSimulateRequest(BaseModel):
+    """POST /route-simulate 请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    buckets: Annotated[list[BucketSpec], Field(min_length=1, description="令牌桶集合")]
+    requests: Annotated[
+        list[RouteRequest], Field(min_length=1, description="按时间戳模拟的路由请求序列")
+    ]
+
+    @model_validator(mode="after")
+    def _cross_validate(self):
+        errors = _route_cross_validation_errors(self.buckets, self.requests)
+        if errors:
+            raise RequestValidationErrors(errors)
+        return self
+
+
+class RouteCandidateRejection(BaseModel):
+    """单条候选链的拒绝原因。"""
+
+    candidate_index: Annotated[int, Field(description="该候选链在 candidates 中的下标")]
+    chain: Annotated[list[str], Field(description="该候选链（按顺序引用的桶 ID）")]
+    rejected_by: Annotated[str, Field(description="该候选链上第一个余额不足的桶 ID")]
+
+
+class RouteResult(BaseModel):
+    """单项路由请求的试算结果。"""
+
+    request_id: str
+    index: Annotated[int, Field(description="该请求在原始 requests 数组中的下标")]
+    timestamp: float
+    allowed: bool
+    selected_index: Annotated[
+        int | None,
+        Field(default=None, description="选中候选链在 candidates 中的下标；拒绝时为 null"),
+    ] = None
+    selected_chain: Annotated[
+        list[str] | None,
+        Field(default=None, description="选中的桶链；拒绝时为 null"),
+    ] = None
+    rejections: Annotated[
+        list[RouteCandidateRejection] | None,
+        Field(
+            default=None,
+            description="拒绝时各候选链的首个不足桶（按候选顺序）；放行时为 null",
+        ),
+    ] = None
+    balances: Annotated[
+        dict[str, BucketBalance],
+        Field(
+            description=(
+                "余额快照：放行时为选中链各桶扣减前后；"
+                "拒绝时为全部候选链涉及的桶（after == before，原子不变）"
+            )
+        ),
+    ]
+
+
+class RouteSimulateResponse(BaseModel):
+    allowed_count: int
+    rejected_count: int
+    results: Annotated[
+        list[RouteResult], Field(description="逐项路由结果，按原始输入索引升序")
+    ]
+    final_balances: Annotated[dict[str, float], Field(description="模拟结束时所有桶的余额")]

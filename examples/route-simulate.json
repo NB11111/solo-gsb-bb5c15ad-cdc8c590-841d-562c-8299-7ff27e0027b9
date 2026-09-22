@@ -1,0 +1,13 @@
+{
+  "buckets": [
+    {"id": "gpu_a", "capacity": 10, "refill_rate": 1, "initial": 10},
+    {"id": "gpu_b", "capacity": 20, "refill_rate": 1, "initial": 10},
+    {"id": "tenant_quota", "capacity": 8, "refill_rate": 0.5, "initial": 8}
+  ],
+  "requests": [
+    {"id": "req-1", "timestamp": 0, "cost": 4, "candidates": [["gpu_a"], ["gpu_b"]]},
+    {"id": "req-2", "timestamp": 0, "cost": 4, "candidates": [["gpu_a"], ["gpu_b"]]},
+    {"id": "req-3", "timestamp": 1, "cost": 3, "candidates": [["gpu_a", "tenant_quota"], ["gpu_b"]]},
+    {"id": "req-4", "timestamp": 2, "cost": 6, "candidates": [["gpu_a"], ["gpu_b", "tenant_quota"]]}
+  ]
+}

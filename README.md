@@ -17,6 +17,8 @@
 
 以及 **区间预留试算** 接口 `POST /reservation-simulate`：给定只有容量上限（无补充概念）的桶与一批携带 `start` / `end` / `cost` / `chain` 的区间预留，按 `start` 升序处理；仅当预留的整个半开区间 `[start, end)` 内链上每个桶的并发占用加 `cost` 处处不超过 `capacity` 时才**原子接受**，否则拒绝且不改变任何占用。返回按原始输入索引排列的逐项结果，以及每个桶**合并后的占用区间**与**峰值并发**。
 
+以及 **多候选链路由试算** 接口 `POST /route-simulate`：请求携带 `timestamp` / `cost` 与**多条候选桶链** `candidates`，共享 `/simulate` 的连续补充令牌桶并按时间戳与输入顺序回放；每次仅在候选链上**所有桶**余额充足时该链才可选，在可选链中选择**扣减后链上最大占用率最小**的一条（平局按候选顺序），**仅扣选中链**；无可选链时所有桶**原子保持不变**，并给出每条候选链上首个余额不足的桶。响应按原始索引返回选中链、余额快照、拒绝原因与终态余额。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -36,6 +38,7 @@ docker compose up --build
 | 使用分析接口 | http://localhost:8000/usage-report （POST） |
 | 公平性分析接口 | http://localhost:8000/fairness-report （POST） |
 | 预留试算接口 | http://localhost:8000/reservation-simulate （POST） |
+| 路由试算接口 | http://localhost:8000/route-simulate （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -545,19 +548,107 @@ docker compose up --build
 - index 0 接受；index 1 与 index 0 在 `[2,3)` 重叠，`room_b` 容量 1 放不下第二笔，被原子拒绝（`room_a` 也不留占用）；
 - index 2、3 接受：`room_a` 在 `[6,7)` 峰值并发 2；index 4 在 t=7 与 index 3 端点相接（半开，不并发），链上均有空位，接受。
 
+## 请求格式 `POST /route-simulate`
+
+```json
+{
+  "buckets": [
+    {"id": "gpu_a", "capacity": 10, "refill_rate": 1, "initial": 10},
+    {"id": "gpu_b", "capacity": 20, "refill_rate": 1, "initial": 10},
+    {"id": "tenant_quota", "capacity": 8, "refill_rate": 0.5, "initial": 8}
+  ],
+  "requests": [
+    {"id": "req-1", "timestamp": 0, "cost": 4, "candidates": [["gpu_a"], ["gpu_b"]]},
+    {"id": "req-2", "timestamp": 0, "cost": 4, "candidates": [["gpu_a"], ["gpu_b"]]},
+    {"id": "req-3", "timestamp": 1, "cost": 3, "candidates": [["gpu_a", "tenant_quota"], ["gpu_b"]]},
+    {"id": "req-4", "timestamp": 2, "cost": 6, "candidates": [["gpu_a"], ["gpu_b", "tenant_quota"]]}
+  ]
+}
+```
+
+### 字段说明
+
+**桶 `buckets[]`**：与 `/simulate` 完全相同的 `BucketSpec`（`id` / `capacity` / `refill_rate` / 可选 `initial`），所有候选链共享同一组连续补充令牌桶。
+
+**请求 `requests[]`**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 请求唯一标识 |
+| `timestamp` | 是 | 请求时间（秒，任意一致的时间原点） |
+| `cost` | 是 | 消耗量，必须 > 0；从**选中链**上每个桶各扣此数量 |
+| `candidates` | 是 | 候选桶链列表（至少 1 条）；每条链为桶 ID 列表（至少 1 个），同一链内不可重复 |
+
+### 路由语义
+
+1. **回放顺序**：与 `/simulate` 一致——所有请求按 `timestamp` 升序处理，同一时间戳按输入数组顺序处理；`results` 仍按原始数组顺序返回（含 `index`）。桶在模拟起始时刻持有 `initial` 余额，被请求触及时按时间差连续补充、封顶 `capacity`。
+2. **可行候选**：对每条候选链，链上**每个桶**在判定时刻（补充之后）余额都 ≥ `cost` 才可选；任一不足则该候选出局。
+3. **选路规则**：在可行候选中，计算各链**扣减后链上最大占用率** = `max((capacity - (余额 - cost)) / capacity)`（对链上各桶取最大），选该值**最小**的链；并列（1e-9 容差内）按 `candidates` 数组顺序取先者。
+4. **原子扣减**：仅扣**选中链**上的桶（每桶各扣 `cost`），未选中的候选链不做任何扣减；无可行候选时**所有桶保持不变**（时间照常推进、继续补充），`rejections` 按候选顺序给出每条候选链上**首个余额不足的桶**。
+5. **余额快照**：放行时 `balances` 为选中链各桶扣减前后余额；拒绝时为全部候选链涉及的桶（`after == before`，体现原子不变）。`final_balances` 给出所有桶推进到最后一个时间戳后的终态余额。
+
+### 响应示例
+
+```json
+{
+  "allowed_count": 3,
+  "rejected_count": 1,
+  "results": [
+    {
+      "request_id": "req-1", "index": 0, "timestamp": 0.0, "allowed": true,
+      "selected_index": 0, "selected_chain": ["gpu_a"], "rejections": null,
+      "balances": {"gpu_a": {"before": 10.0, "after": 6.0}}
+    },
+    {
+      "request_id": "req-2", "index": 1, "timestamp": 0.0, "allowed": true,
+      "selected_index": 1, "selected_chain": ["gpu_b"], "rejections": null,
+      "balances": {"gpu_b": {"before": 10.0, "after": 6.0}}
+    },
+    {
+      "request_id": "req-3", "index": 2, "timestamp": 1.0, "allowed": true,
+      "selected_index": 0, "selected_chain": ["gpu_a", "tenant_quota"], "rejections": null,
+      "balances": {
+        "gpu_a": {"before": 7.0, "after": 4.0},
+        "tenant_quota": {"before": 8.0, "after": 5.0}
+      }
+    },
+    {
+      "request_id": "req-4", "index": 3, "timestamp": 2.0, "allowed": false,
+      "selected_index": null, "selected_chain": null,
+      "rejections": [
+        {"candidate_index": 0, "chain": ["gpu_a"], "rejected_by": "gpu_a"},
+        {"candidate_index": 1, "chain": ["gpu_b", "tenant_quota"], "rejected_by": "tenant_quota"}
+      ],
+      "balances": {
+        "gpu_a": {"before": 5.0, "after": 5.0},
+        "gpu_b": {"before": 8.0, "after": 8.0},
+        "tenant_quota": {"before": 5.5, "after": 5.5}
+      }
+    }
+  ],
+  "final_balances": {"gpu_a": 5.0, "gpu_b": 8.0, "tenant_quota": 5.5}
+}
+```
+
+- req-1：`gpu_a` 扣后占用率 (10−6)/10 = 0.4 < `gpu_b` 的 (20−6)/20 = 0.7 → 选 `["gpu_a"]`；
+- req-2：此时 `gpu_a` 扣后占用率 0.8 > `gpu_b` 的 0.7 → 改选 `["gpu_b"]`（选路随扣减后状态动态变化）；
+- req-3：t=1 各桶补充 1 秒；候选 0 链上最大占用率 max(0.6, 0.375) = 0.6 < 候选 1 的 0.8 → 选 `["gpu_a", "tenant_quota"]`，仅这两个桶被扣；
+- req-4：t=2 时 `gpu_a` 余 5 不足 6（候选 0 出局），候选 1 中 `gpu_b` 充足但 `tenant_quota` 余 5.5 不足 → 无可行候选，**所有桶原子不变**，`rejections` 给出各候选首个不足桶。
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
 
 - **重复桶**：`buckets[].id` 重复（`duplicate_bucket`）；
 - **非法速率/容量**：`capacity <= 0`、`refill_rate < 0`、非有限数值、`initial`/`balance` 越界；
-- **未知引用**：`chain` 引用了未在 `buckets` 中定义的 ID（`unknown_bucket_ref`）；
+- **未知引用**：`chain` 引用了未在 `buckets` 中定义的 ID（`unknown_bucket_ref`；`/route-simulate` 对每条候选链 `candidates[][]` 同样校验）；
+- **非法候选链**（仅 `/route-simulate`）：`candidates` 为空、候选链为空、候选链内桶重复；
 - **非法窗口宽度**：`window_seconds` 缺失、非有限数值或 `<= 0`（`/usage-report` 与 `/fairness-report`）；
 - **非法主体字段**（仅 `/fairness-report`）：`principal` 缺失或不是非空字符串；`weight` 非有限数值或 `<= 0`；同一 `principal` 在不同请求中权重不一致（`inconsistent_principal_weight`）；
 - **非法预留区间**：`start` / `end` 非有限数值，或 `end <= start`（仅 `/reservation-simulate`）；
 - 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report` 与 `/reservation-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型）。
+以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate` 与 `/route-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对全部候选链做引用校验）。
 
 ## 本地调用示例
 
@@ -585,6 +676,10 @@ curl -X POST http://localhost:8000/fairness-report \
 curl -X POST http://localhost:8000/reservation-simulate \
   -H 'Content-Type: application/json' \
   -d @examples/reservation-simulate.json
+
+curl -X POST http://localhost:8000/route-simulate \
+  -H 'Content-Type: application/json' \
+  -d @examples/route-simulate.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -614,6 +709,7 @@ pytest -q
 │   ├── usage.py         # 配额使用分析引擎（按窗口统计消耗/拒绝/峰值占用）
 │   ├── fairness.py      # 主体公平性分析引擎（加权 Jain 指数/最受限主体/首个短缺桶）
 │   ├── reservation.py   # 区间预留试算引擎（容量受限的链上原子预留）
+│   ├── routing.py       # 多候选链路由试算引擎（最小扣减后最大占用率选路）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
@@ -622,6 +718,7 @@ pytest -q
 ├── examples/usage-report.json
 ├── examples/fairness-report.json
 ├── examples/reservation-simulate.json
+├── examples/route-simulate.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口

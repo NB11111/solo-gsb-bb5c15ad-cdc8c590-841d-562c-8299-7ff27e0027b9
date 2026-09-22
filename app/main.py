@@ -17,6 +17,8 @@ from app.models import (
     PlanInitialBalancesResponse,
     ReservationSimulateRequest,
     ReservationSimulateResponse,
+    RouteSimulateRequest,
+    RouteSimulateResponse,
     SimulateRequest,
     SimulateResponse,
     UsageReportRequest,
@@ -24,6 +26,7 @@ from app.models import (
 )
 from app.planner import plan_initial_balances
 from app.reservation import reservation_simulate
+from app.routing import route_simulate
 from app.simulation import simulate
 from app.usage import usage_report
 
@@ -38,7 +41,10 @@ app = FastAPI(
         "/fairness-report：按 principal 统计放行消耗与拒绝次数，给出加权 Jain "
         "公平指数、最受限主体及其首个短缺桶（全局与逐窗口）；"
         "以及 /reservation-simulate：按 start 升序对区间预留做容量受限的链上原子试算，"
-        "返回逐项结果与每桶合并后的占用区间、峰值并发。"
+        "返回逐项结果与每桶合并后的占用区间、峰值并发；"
+        "以及 /route-simulate：在共享连续补充令牌桶上为多候选链请求选路，"
+        "按扣减后链上最大占用率最小（平局按候选顺序）选择可行链并仅扣选中链，"
+        "无可行链时所有桶原子不变并给出各候选首个不足桶。"
     ),
     version="1.0.0",
 )
@@ -67,6 +73,7 @@ def root():
         "usage_report": "/usage-report",
         "fairness_report": "/fairness-report",
         "reservation_simulate": "/reservation-simulate",
+        "route_simulate": "/route-simulate",
     }
 
 
@@ -109,3 +116,14 @@ def reservation_simulate_endpoint(
     payload: ReservationSimulateRequest,
 ) -> ReservationSimulateResponse:
     return reservation_simulate(payload)
+
+
+@app.post(
+    "/route-simulate",
+    response_model=RouteSimulateResponse,
+    tags=["routing"],
+)
+def route_simulate_endpoint(
+    payload: RouteSimulateRequest,
+) -> RouteSimulateResponse:
+    return route_simulate(payload)
